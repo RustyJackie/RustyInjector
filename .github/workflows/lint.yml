@@ -1,0 +1,25 @@
+name: Lint
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check syntax
+        run: |
+          python -m py_compile injector.py
+          python -m py_compile core/ptrace.py
+          python -m py_compile core/shellcode.py
+          python -m py_compile core/gdb.py
+          python -m py_compile core/stealth.py
+          python -m py_compile utils/log.py
+          python -m py_compile utils/signals.py
+          python -m py_compile utils/preflight.py
