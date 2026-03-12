@@ -7,6 +7,7 @@ handler can call detach() even if the main thread is blocked in waitpid().
 
 import sys
 import signal as _signal
+from types import FrameType
 from typing import TYPE_CHECKING, Optional
 
 from utils.log import _log, warn
@@ -18,15 +19,17 @@ if TYPE_CHECKING:
 _active_injector: Optional["PtraceInjector"] = None
 
 
-def _sigint_handler(sig, frame) -> None:
+def _sigint_handler(sig: int, frame: Optional[FrameType]) -> None:
     print("\n\n  Interrupted — detaching cleanly.\n")
     _log("WARNING", "Caught SIGINT")
+    # _attached indicates that we successfully ptrace-attached; ensure we
+    # always detach so the target process is left runnable.
     if _active_injector and _active_injector._attached:
         _active_injector.detach()
     sys.exit(130)
 
 
-def _sigterm_handler(sig, frame) -> None:
+def _sigterm_handler(sig: int, frame: Optional[FrameType]) -> None:
     """
     If we're killed after attaching but before detaching, the target
     would stay frozen indefinitely. This ensures we always leave it runnable.

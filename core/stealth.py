@@ -58,6 +58,8 @@ def check_monitors(abort_on_found: bool = False) -> List[str]:
     If abort_on_found=True the function calls die() immediately.
     Otherwise returns a list so the caller can decide.
     """
+    # Heuristic list of common tracers/EDR agents; not exhaustive and names
+    # may vary between distributions and vendors.
     suspects = {
         # Classic Linux tracers
         "strace", "ltrace", "perf", "bpftrace",
@@ -149,7 +151,8 @@ def memfd_stage(lib_path: Path) -> Tuple[str, int]:
     The library appears as 'memfd:<random>' in /proc/pid/maps instead
     of its real filesystem path.
     """
-    SYS_memfd_create = 319  # x86_64
+    # x86_64-specific syscall number; other architectures may differ.
+    SYS_memfd_create = 319  # x86_64 (other architectures may differ)
 
     libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
     libc.syscall.restype  = ctypes.c_long
