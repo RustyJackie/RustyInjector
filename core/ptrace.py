@@ -241,6 +241,12 @@ class PtraceInjector:
                 sig = os.WSTOPSIG(status)
                 if sig == _signal.SIGTRAP:
                     return
+                if sig == _signal.SIGSEGV:
+                    try:
+                        fault_regs = self.get_regs()
+                        _log("DEBUG", f"SIGSEGV at RIP=0x{fault_regs.rip:x}  RSP=0x{fault_regs.rsp:x}  RDI=0x{fault_regs.rdi:x}")
+                    except Exception:
+                        pass
                 _log("DEBUG", f"Forwarding signal {sig} to target")
                 fwd_sig = sig
 
@@ -279,58 +285,80 @@ class PtraceInjector:
     def find_dlopen_addr(self) -> int:
         """
         Resolve dlopen() address in the target process.
-
-        We load the same shared library into our own address space, compute
-        the symbol's offset from our base, then apply that offset to the
-        target's base address.  ASLR shifts entire libraries uniformly —
-        intra-library offsets are invariant.
+    
+        Instead of guessing the library base by name (which can match wrong
+        libraries like libcrypto), we locate the exact segment that contains
+        our own dlopen pointer, then find the same segment in the target by
+        matching library path + file offset. ASLR shifts segments uniformly
+        so the intra-segment offset is invariant.
         """
-        target_base = 0
-        lib_file    = ""
-        lib_hint    = ""
-
-        for hint in ("libdl", "libc"):
-            target_base, lib_file = self._find_lib_base(self.pid, hint)
-            if target_base:
-                lib_hint = hint
-                break
-
-        if not target_base:
-            raise InjectionError(
-                "Could not locate libdl/libc in target process maps.\n"
-                f"      Inspect manually: cat /proc/{self.pid}/maps | grep -E 'libc|libdl'"
-            )
-
-        our_base, _ = self._find_lib_base(os.getpid(), lib_hint)
-        if not our_base:
-            raise InjectionError(f"Could not find {lib_hint} in our own address space")
-
-        handle = ctypes.CDLL(lib_file)
-        fn_ptr = None
+        # Step 1: get dlopen address in our own process
+        lib_name = ctypes.util.find_library("dl") or ctypes.util.find_library("c")
+        handle   = ctypes.CDLL(lib_name)
+        fn_ptr   = None
         for sym in ("dlopen", "__libc_dlopen_mode"):
             try:
                 fn_ptr = getattr(handle, sym)
                 break
             except AttributeError:
                 continue
-
         if fn_ptr is None:
+            raise InjectionError("Neither 'dlopen' nor '__libc_dlopen_mode' found")
+    
+        our_dlopen = ctypes.cast(fn_ptr, ctypes.c_void_p).value
+    
+        # Step 2: find which segment in OUR maps contains our_dlopen
+        our_seg_start  = 0
+        our_file_off   = 0
+        our_lib_path   = ""
+        for line in Path(f"/proc/{os.getpid()}/maps").read_text().splitlines():
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            start, end = (int(x, 16) for x in parts[0].split("-"))
+            if start <= our_dlopen < end:
+                our_seg_start = start
+                our_file_off  = int(parts[2], 16)
+                our_lib_path  = parts[-1]
+                break
+    
+        if not our_seg_start:
+            raise InjectionError("Could not locate dlopen segment in our own maps")
+    
+        our_intra_offset = our_dlopen - our_seg_start
+        _log("DEBUG", f"our dlopen=0x{our_dlopen:x}  seg=0x{our_seg_start:x}"
+                      f"  file_off=0x{our_file_off:x}  lib={Path(our_lib_path).name}")
+    
+        # Step 3: find the same segment in the target (same path + same file offset)
+        lib_basename = Path(our_lib_path).name
+        target_seg_start = 0
+        try:
+            for line in Path(f"/proc/{self.pid}/maps").read_text().splitlines():
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                if Path(parts[-1]).name != lib_basename:
+                    continue
+                if int(parts[2], 16) != our_file_off:
+                    continue
+                target_seg_start = int(parts[0].split("-")[0], 16)
+                break
+        except (FileNotFoundError, PermissionError):
+            pass
+    
+        if not target_seg_start:
             raise InjectionError(
-                f"Neither 'dlopen' nor '__libc_dlopen_mode' found in {lib_file}"
+                f"Could not find segment '{lib_basename}' (file_off=0x{our_file_off:x})"
+                f" in target /proc/{self.pid}/maps"
             )
-
-        dlopen_ours = ctypes.cast(fn_ptr, ctypes.c_void_p).value
-        offset      = dlopen_ours - our_base
-
-        _log("DEBUG",
-             f"dlopen in {Path(lib_file).name}: "
-             f"our_base=0x{our_base:x}  offset=+0x{offset:x}  "
-             f"target=0x{target_base + offset:x}")
-
-        return target_base + offset
-
-    # ── Main injection entry point ────────────────────────────────────────────
-
+    
+        target_dlopen = target_seg_start + our_intra_offset
+        _log("DEBUG", f"target seg=0x{target_seg_start:x}  "
+                      f"target dlopen=0x{target_dlopen:x}")
+    
+        return target_dlopen
+        # ── Main injection entry point ────────────────────────────────────────────
+    
     def inject(self, lib_path: Path) -> bool:
         """
         Full injection sequence. Raises InjectionError on failure.

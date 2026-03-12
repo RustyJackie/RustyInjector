@@ -124,14 +124,15 @@ def check_selinux_apparmor(pid: int) -> Optional[str]:
         attr = Path(f"/proc/{pid}/attr/current").read_text().strip()
         if attr and attr != "unconfined":
             return f"AppArmor:{attr}"
-    except (FileNotFoundError, PermissionError):
+    except (FileNotFoundError, PermissionError, OSError):
         pass
+
     # SELinux
     try:
         ctx = Path(f"/proc/{pid}/attr/sockcreate").read_text().strip()
         if ctx:
             return f"SELinux:{ctx}"
-    except (FileNotFoundError, PermissionError):
+    except (FileNotFoundError, PermissionError, OSError):
         pass
     return None
 

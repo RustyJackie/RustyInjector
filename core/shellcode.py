@@ -37,18 +37,9 @@ MMAP_STUB = bytes([
 
 
 def build_dlopen_stub(dlopen_addr: int, lib_path: bytes) -> bytes:
-    """
-    Build a stub that calls dlopen(lib_path, RTLD_NOW) then INT3.
-
-    Layout:
-      [0 ]  movabs rax, <dlopen_addr>   10 bytes
-      [10]  lea    rdi, [rip + 8]        7 bytes  (points to path string below)
-      [17]  mov    esi, 2                5 bytes  (RTLD_NOW)
-      [22]  call   rax                   2 bytes
-      [24]  int3                         1 byte
-      [25]  <lib_path>\\x00              variable
-    """
     sc  = b"\x48\xB8" + struct.pack("<Q", dlopen_addr)   # movabs rax
+    sc += b"\x48\x81\xEC\x80\x00\x00\x00"               # sub rsp, 128  (skip red zone)
+    sc += b"\x48\x83\xE4\xF0"                            # and rsp, -16
     sc += b"\x48\x8D\x3D" + struct.pack("<i", 8)         # lea rdi, [rip+8]
     sc += b"\xBE\x02\x00\x00\x00"                        # mov esi, 2
     sc += b"\xFF\xD0"                                     # call rax
