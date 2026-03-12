@@ -90,10 +90,12 @@ class PtraceInjector:
     PTRACE_PEEKDATA = 2
     PTRACE_POKEDATA = 5
     PTRACE_CONT     = 7
+    PTRACE_SYSCALL  = 24
     PTRACE_GETREGS  = 12
     PTRACE_SETREGS  = 13
     PTRACE_ATTACH   = 16
     PTRACE_DETACH   = 17
+    PTRACE_SYSCALL  = 24
 
     def __init__(self, pid: int):
         self.pid           = pid
@@ -159,6 +161,7 @@ class PtraceInjector:
             )
         self._attached = True
         _log("DEBUG", f"Attached to main thread PID {self.pid}")
+        self._escape_syscall_if_needed()
 
         for tid in get_all_tids(self.pid):
             if tid == self.pid:
@@ -170,6 +173,37 @@ class PtraceInjector:
                 _log("DEBUG", f"Stopped extra thread TID {tid}")
             except OSError as exc:
                 _log("DEBUG", f"Could not stop TID {tid}: {exc}")
+
+    def _escape_syscall_if_needed(self) -> None:
+        _RESTART_CODES = {
+            2**64 - 512,
+            2**64 - 513,
+            2**64 - 514,
+            2**64 - 516,
+        }
+        try:
+            regs = self.get_regs()
+        except InjectionError:
+            return
+        if regs.rax not in _RESTART_CODES:
+            return
+        syscall_nr = regs.orig_rax
+        _log("DEBUG",
+             f"Process stopped inside syscall {syscall_nr} "
+             f"(rax=0x{regs.rax:x}) — stepping out via PTRACE_SYSCALL")
+        # cancel the blocking syscall by setting orig_rax=-1
+        # the kernel returns -ENOSYS immediately instead of waiting
+        cancel_regs = self.get_regs()
+        cancel_regs.orig_rax = 2**64 - 1
+        self.set_regs(cancel_regs)
+        self._ptrace(self.PTRACE_SYSCALL, addr=0, data=0)
+        _, status = os.waitpid(self.pid, 0)
+        if not os.WIFSTOPPED(status):
+            raise InjectionError(
+                f"Process exited unexpectedly while escaping syscall "
+                f"(status=0x{status:x})"
+            )
+        _log("DEBUG", f"Escaped syscall {syscall_nr}, now at RIP=0x{self.get_regs().rip:x}")
 
     def detach(self) -> None:
         """Detach all threads in reverse order (extra threads first)."""
