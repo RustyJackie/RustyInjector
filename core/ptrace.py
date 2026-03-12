@@ -30,7 +30,7 @@ import ctypes.util
 import signal as _signal
 import struct
 from pathlib import Path
-from typing import IO, List, Optional, Tuple
+from typing import IO, List, Optional
 
 from utils.log import _log, InjectionError
 from core.stealth import jitter, get_all_tids
@@ -90,7 +90,6 @@ class PtraceInjector:
     PTRACE_PEEKDATA = 2
     PTRACE_POKEDATA = 5
     PTRACE_CONT     = 7
-    PTRACE_SYSCALL  = 24
     PTRACE_GETREGS  = 12
     PTRACE_SETREGS  = 13
     PTRACE_ATTACH   = 16
@@ -487,7 +486,9 @@ class PtraceInjector:
         except InjectionError:
             raise
         except OSError as exc:
-            raise InjectionError(f"OS error during injection: {exc}") from exc
+            raise InjectionError(
+                f"OS error during injection (errno={exc.errno}): {exc}"
+            ) from exc
         except Exception as exc:
             raise InjectionError(f"Unexpected error: {exc}") from exc
         finally:
