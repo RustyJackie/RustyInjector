@@ -8,8 +8,9 @@ import platform
 import shutil
 import sys
 from pathlib import Path
+from typing import List
 
-from utils.log import ok, info, warn, err, die, DIM, W, RST
+from utils.log import ok, info, warn, die, DIM, W, RST
 from core.stealth import check_monitors
 
 
@@ -36,7 +37,10 @@ def preflight(method: str, require_root: bool, abort_on_monitors: bool) -> None:
 
     scope_file = Path("/proc/sys/kernel/yama/ptrace_scope")
     if scope_file.exists():
-        scope = int(scope_file.read_text().strip())
+        try:
+            scope = int(scope_file.read_text().strip())
+        except (OSError, ValueError):
+            scope = 0
         if scope >= 2:
             die(
                 f"ptrace locked down (scope={scope}). Injection won't work.\n"
@@ -57,7 +61,7 @@ def preflight(method: str, require_root: bool, abort_on_monitors: bool) -> None:
     ok("Preflight passed.\n")
 
 
-def _scan_proc_for_name(name: str) -> list:
+def _scan_proc_for_name(name: str) -> List[int]:
     """
     Walk /proc and return all PIDs whose /proc/<pid>/comm matches *name*.
     Returns an empty list if nothing is found (no external tools needed).
