@@ -101,8 +101,6 @@ def build_parser() -> argparse.ArgumentParser:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print()
-
     parser = build_parser()
     args   = parser.parse_args()
 
@@ -110,11 +108,18 @@ def main() -> None:
     _log_mod.configure(silent=args.silent, log_file=args.log)
     setup_colors()
 
+    if not args.silent:
+        print()
+
     # Register signal handlers for clean detach on interrupt
     _signals.register_handlers()
 
     # Optionally mask our process name in ps
-    original_comm = Path("/proc/self/comm").read_text().strip()
+    original_comm = None
+    try:
+        original_comm = Path("/proc/self/comm").read_text().strip()
+    except OSError:
+        pass
     if args.mask_comm:
         mask_process_comm(args.mask_comm)
         info(f"Process comm masked as  {DIM}'{args.mask_comm[:15]}'{RST}")
@@ -141,7 +146,7 @@ def main() -> None:
     inject_path = library
     used_memfd  = False
 
-    if args.memfd and not args.dry_run:
+        if args.memfd and not args.dry_run:
         try:
             staged, memfd_fd = memfd_stage(library)
             inject_path = Path(staged)
@@ -155,7 +160,8 @@ def main() -> None:
     try:
         if args.dry_run:
             warn(f"[DRY RUN] Would inject  {W}{inject_path}{RST}  into PID {W}{pid}{RST}")
-            warn(f"          Method: {args.method}" + ("  +memfd" if args.memfd else ""))
+            suffix = "  (would use memfd)" if args.memfd else ""
+            warn(f"          Method: {args.method}{suffix}")
             success = True
 
         elif args.method == "ptrace":
@@ -176,7 +182,7 @@ def main() -> None:
                 os.close(memfd_fd)
             except OSError:
                 pass
-        if args.mask_comm:
+        if args.mask_comm and original_comm:
             restore_process_comm(original_comm)
 
     # Post-injection verification
@@ -186,14 +192,16 @@ def main() -> None:
     # Result
     log_hint = f"  {DIM}Log: {_log_mod._log_file}{RST}" if _log_mod._log_file else ""
     if success:
-        if not args.silent:
-            print(f"\n  {BOLD}{G}Done.{RST}{log_hint}\n")
+        ok(f"Done.{log_hint}")
     else:
-        if not args.silent:
-            print(
-                f"\n  {R}Injection failed.{RST}"
-                + (f"  See {DIM}{_log_mod._log_file}{RST}" if _log_mod._log_file else "") + "\n"
+        err(
+            "Injection failed."
+            + (
+                f" See {DIM}{_log_mod._log_file}{RST}"
+                if _log_mod._log_file
+                else ""
             )
+        )
         sys.exit(1)
 
 
