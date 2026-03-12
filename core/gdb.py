@@ -13,7 +13,7 @@ import secrets
 import subprocess
 from pathlib import Path
 
-from utils.log import _log, info, warn, err, DIM, W, RST, InjectionError
+from utils.log import _log, info, err, DIM, W, RST, InjectionError
 from core.stealth import secure_delete
 
 try:
@@ -62,11 +62,16 @@ def inject_via_gdb(pid: int, library: Path) -> bool:
             stderr = result.stderr.decode(errors="replace").strip()
             err(f"GDB exited with code {result.returncode}.")
             if stderr:
-                print(f"\n  {DIM}{stderr[:600]}{RST}\n")
+                err(f"GDB stderr (truncated): {DIM}{stderr[:600]}{RST}")
             return False
 
         return True
 
+    except FileNotFoundError:
+        raise InjectionError(
+            "gdb executable not found in PATH. "
+            "Install gdb or adjust your PATH and try again."
+        ) from None
     except subprocess.TimeoutExpired:
         raise InjectionError("GDB timed out after 30 s. Is the target frozen?")
     finally:
