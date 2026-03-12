@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Compiled shared libraries (don't accidentally commit test payloads)
+*.so
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
