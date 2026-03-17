@@ -30,7 +30,7 @@ import ctypes.util
 import signal as _signal
 import struct
 from pathlib import Path
-from typing import IO, List, Optional
+from typing import IO, List, Optional, Tuple
 
 from utils.log import _log, InjectionError
 from core.stealth import jitter, get_all_tids
@@ -96,8 +96,9 @@ class PtraceInjector:
     PTRACE_DETACH   = 17
     PTRACE_SYSCALL  = 24
 
-    def __init__(self, pid: int):
+    def __init__(self, pid: int, timeout: int = 30):
         self.pid           = pid
+        self.timeout       = timeout          # seconds before a waitpid step is aborted
         self._attached     = False
         self._extra_tids:  List[int] = []
         self._mem_fd:      Optional[IO[bytes]] = None   # open during inject()
@@ -153,7 +154,7 @@ class PtraceInjector:
             return
 
         self._ptrace(self.PTRACE_ATTACH)
-        _, status = os.waitpid(self.pid, 0)
+        _, status = self._waitpid_timeout(self.pid)
         if not os.WIFSTOPPED(status):
             raise InjectionError(
                 f"Expected SIGSTOP after PTRACE_ATTACH, got status=0x{status:x}"
@@ -172,6 +173,29 @@ class PtraceInjector:
                 _log("DEBUG", f"Stopped extra thread TID {tid}")
             except OSError as exc:
                 _log("DEBUG", f"Could not stop TID {tid}: {exc}")
+
+    def _waitpid_timeout(self, pid: int) -> Tuple[int, int]:
+        """
+        waitpid() with a SIGALRM-based timeout.
+        Raises InjectionError if the process does not stop within self.timeout seconds.
+        """
+        import signal as _sig
+
+        def _alarm_handler(signum: int, frame) -> None:  # type: ignore[type-arg]
+            raise InjectionError(
+                f"Timed out after {self.timeout}s waiting for PID {pid} to stop.\n"
+                "      The process may be in an uninterruptible state (e.g. D-state).\n"
+                "      Try a higher --timeout value or check the target."
+            )
+
+        old_handler = _sig.signal(_sig.SIGALRM, _alarm_handler)
+        _sig.alarm(self.timeout)
+        try:
+            result = os.waitpid(pid, 0)
+        finally:
+            _sig.alarm(0)
+            _sig.signal(_sig.SIGALRM, old_handler)
+        return result
 
     def _escape_syscall_if_needed(self) -> None:
         _RESTART_CODES = {
@@ -196,7 +220,7 @@ class PtraceInjector:
         cancel_regs.orig_rax = 2**64 - 1
         self.set_regs(cancel_regs)
         self._ptrace(self.PTRACE_SYSCALL, addr=0, data=0)
-        _, status = os.waitpid(self.pid, 0)
+        _, status = self._waitpid_timeout(self.pid)
         if not os.WIFSTOPPED(status):
             raise InjectionError(
                 f"Process exited unexpectedly while escaping syscall "
@@ -268,7 +292,7 @@ class PtraceInjector:
         fwd_sig = 0
         while True:
             self._ptrace(self.PTRACE_CONT, addr=0, data=fwd_sig)
-            _, status = os.waitpid(self.pid, 0)
+            _, status = self._waitpid_timeout(self.pid)
 
             if os.WIFSTOPPED(status):
                 sig = os.WSTOPSIG(status)
@@ -290,35 +314,10 @@ class PtraceInjector:
 
     # ── Symbol resolution ─────────────────────────────────────────────────────
 
-    @staticmethod
-    def _find_lib_base(pid: int, name_hint: str) -> Tuple[int, str]:
-        """
-        Scan /proc/pid/maps for the first mapping of the library matching
-        name_hint. We take the lowest address regardless of permissions —
-        the LOAD segment header (r--p) typically comes before the code
-        segment (r-xp) and gives us the true ELF base.
-        """
-        best_addr = 0
-        best_path = ""
-        try:
-            for line in Path(f"/proc/{pid}/maps").read_text().splitlines():
-                parts = line.split()
-                if len(parts) < 6:
-                    continue
-                if name_hint not in parts[-1]:
-                    continue
-                addr = int(parts[0].split("-")[0], 16)
-                if best_addr == 0 or addr < best_addr:
-                    best_addr = addr
-                    best_path = parts[-1]
-        except (FileNotFoundError, PermissionError):
-            pass
-        return best_addr, best_path
-
     def find_dlopen_addr(self) -> int:
         """
         Resolve dlopen() address in the target process.
-    
+
         Instead of guessing the library base by name (which can match wrong
         libraries like libcrypto), we locate the exact segment that contains
         our own dlopen pointer, then find the same segment in the target by
@@ -337,9 +336,9 @@ class PtraceInjector:
                 continue
         if fn_ptr is None:
             raise InjectionError("Neither 'dlopen' nor '__libc_dlopen_mode' found")
-    
+
         our_dlopen = ctypes.cast(fn_ptr, ctypes.c_void_p).value
-    
+
         # Step 2: find which segment in OUR maps contains our_dlopen
         our_seg_start  = 0
         our_file_off   = 0
@@ -354,14 +353,14 @@ class PtraceInjector:
                 our_file_off  = int(parts[2], 16)
                 our_lib_path  = parts[-1]
                 break
-    
+
         if not our_seg_start:
             raise InjectionError("Could not locate dlopen segment in our own maps")
-    
+
         our_intra_offset = our_dlopen - our_seg_start
         _log("DEBUG", f"our dlopen=0x{our_dlopen:x}  seg=0x{our_seg_start:x}"
                       f"  file_off=0x{our_file_off:x}  lib={Path(our_lib_path).name}")
-    
+
         # Step 3: find the same segment in the target (same path + same file offset)
         lib_basename = Path(our_lib_path).name
         target_seg_start = 0
@@ -378,20 +377,21 @@ class PtraceInjector:
                 break
         except (FileNotFoundError, PermissionError):
             pass
-    
+
         if not target_seg_start:
             raise InjectionError(
                 f"Could not find segment '{lib_basename}' (file_off=0x{our_file_off:x})"
                 f" in target /proc/{self.pid}/maps"
             )
-    
+
         target_dlopen = target_seg_start + our_intra_offset
         _log("DEBUG", f"target seg=0x{target_seg_start:x}  "
                       f"target dlopen=0x{target_dlopen:x}")
-    
+
         return target_dlopen
-        # ── Main injection entry point ────────────────────────────────────────────
-    
+
+    # ── Main injection entry point ────────────────────────────────────────────
+
     def inject(self, lib_path: Path) -> bool:
         """
         Full injection sequence. Raises InjectionError on failure.
