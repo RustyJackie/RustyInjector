@@ -94,6 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip root privilege check (dangerous)")
     p.add_argument("--log", metavar="PATH", default=None,
                    help="Write log entries to file (default: in-memory only)")
+    p.add_argument("--timeout", type=int, default=30, metavar="SEC",
+                   help="Seconds to wait for each ptrace step before aborting "
+                        "(default: 30)")
 
     return p
 
@@ -146,7 +149,7 @@ def main() -> None:
     inject_path = library
     used_memfd  = False
 
-        if args.memfd and not args.dry_run:
+    if args.memfd and not args.dry_run:
         try:
             staged, memfd_fd = memfd_stage(library)
             inject_path = Path(staged)
@@ -166,7 +169,7 @@ def main() -> None:
 
         elif args.method == "ptrace":
             spinner(f"Injecting  {library.name}  into PID {pid}", duration=0.4)
-            injector = PtraceInjector(pid)
+            injector = PtraceInjector(pid, timeout=args.timeout)
             injector.inject(inject_path)
             success = True
 
