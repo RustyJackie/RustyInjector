@@ -52,6 +52,9 @@ def configure(silent: bool = False, log_file: Optional[str] = None) -> None:
         except OSError:
             _log_fh = None
 
+    # Recompute ANSI colour codes after updating silent/log settings.
+    setup_colors()
+
 
 def _close_log() -> None:
     global _log_fh
